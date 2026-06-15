@@ -594,9 +594,17 @@ impl Playlist {
 
         if !html.is_empty() {
             let serde_value = serde_json::from_str::<serde_json::Value>(&html).unwrap();
-            let contents = &serde_value["contents"]["twoColumnBrowseResultsRenderer"]["tabs"][0]
-                ["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]
-                ["itemSectionRenderer"]["contents"][0]["playlistVideoListRenderer"]["contents"];
+            let item_section = &serde_value["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
+                [0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]
+                ["itemSectionRenderer"]["contents"];
+
+            // Newer responses list videos directly in the itemSectionRenderer contents (as
+            // `lockupViewModel`s). Older responses wrap them inside a `playlistVideoListRenderer`.
+            let contents = if !item_section[0]["playlistVideoListRenderer"]["contents"].is_null() {
+                &item_section[0]["playlistVideoListRenderer"]["contents"]
+            } else {
+                item_section
+            };
 
             let playlist_primary_data = &serde_value["sidebar"]["playlistSidebarRenderer"]["items"]
                 [0]["playlistSidebarPrimaryInfoRenderer"];
@@ -806,11 +814,19 @@ impl Playlist {
                         client_version: Some(get_client_version(&html_first)),
                     }),
                     client,
-                    // Detect course playlist: videos lack shortBylineText
+                    // Detect course playlist: videos lack per-video channel info.
+                    // Legacy format exposes this via `shortBylineText`; the newer
+                    // `lockupViewModel` format via a channel `metadataRow`.
                     is_course: contents
                         .as_array()
                         .and_then(|arr| arr.first())
-                        .map(|v| v["playlistVideoRenderer"]["shortBylineText"].is_null())
+                        .map(|v| {
+                            if !v["lockupViewModel"].is_null() {
+                                lockup_channel_metadata_part(&v["lockupViewModel"]).is_none()
+                            } else {
+                                v["playlistVideoRenderer"]["shortBylineText"].is_null()
+                            }
+                        })
                         .unwrap_or(false),
                 };
 
@@ -943,9 +959,18 @@ impl Playlist {
         }
         let res = res.unwrap();
 
-        let contents = res["onResponseReceivedActions"][0]["appendContinuationItemsAction"]
-            ["continuationItems"]
-            .clone();
+        // Find the action carrying the appended items. The relevant action is not always
+        // at index 0, so search the array for one with `appendContinuationItemsAction`.
+        let contents = res["onResponseReceivedActions"]
+            .as_array()
+            .and_then(|actions| {
+                actions
+                    .iter()
+                    .map(|a| &a["appendContinuationItemsAction"]["continuationItems"])
+                    .find(|c| !c.is_null())
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         if contents.is_null() {
             return Ok(vec![]);
@@ -1102,6 +1127,16 @@ impl Playlist {
                 break;
             }
 
+            // Newer playlist responses represent each video as a `lockupViewModel`.
+            if !info["lockupViewModel"].is_null() {
+                if let Some(video) =
+                    parse_lockup_video(&info["lockupViewModel"], fallback_channel)
+                {
+                    videos.push(video);
+                }
+                continue;
+            }
+
             let video = &info["playlistVideoRenderer"];
             // video not proper type skip it - only require videoId to be present
             if video.is_null() || video["videoId"].is_null() {
@@ -1232,29 +1267,163 @@ impl Playlist {
 
     fn get_continuation_token(context: &serde_json::Value) -> Option<String> {
         // if context is not array return none
-        if !context.is_array() {
-            return None;
-        }
+        let items = context.as_array()?;
 
-        let continuation_token = context.as_array().unwrap().iter().find(|x| {
+        let item = items.iter().find(|x| {
             x.as_object()
-                .map(|x| x.contains_key("continuationItemRenderer"))
+                .map(|x| {
+                    x.contains_key("continuationItemRenderer")
+                        || x.contains_key("continuationItemViewModel")
+                })
                 .unwrap_or(false)
-        });
+        })?;
 
-        if let Some(token) = continuation_token {
-            let continuation_token = &token["continuationItemRenderer"]["continuationEndpoint"]
-                ["continuationCommand"]["token"];
-
-            if continuation_token.is_string() {
-                return Some(continuation_token.as_str().unwrap_or("").to_string());
-            }
-
-            None
-        } else {
-            None
+        // Newer format: `continuationItemViewModel`.
+        let token = &item["continuationItemViewModel"]["continuationCommand"]["innertubeCommand"]
+            ["continuationCommand"]["token"];
+        if token.is_string() {
+            return token.as_str().map(|x| x.to_string());
         }
+
+        // Legacy format: `continuationItemRenderer`.
+        let token = &item["continuationItemRenderer"]["continuationEndpoint"]
+            ["continuationCommand"]["token"];
+        if token.is_string() {
+            return token.as_str().map(|x| x.to_string());
+        }
+
+        None
     }
+}
+
+/// Find the channel `metadataPart` inside a `lockupViewModel`'s metadata rows.
+///
+/// In the `lockupViewModel` format the channel name lives in the first metadata row,
+/// distinguished from the views/age row by having `commandRuns` (a tappable channel link).
+/// Course/learning playlists omit this, so its absence also signals a course playlist.
+fn lockup_channel_metadata_part(lockup: &serde_json::Value) -> Option<&serde_json::Value> {
+    lockup["metadata"]["lockupMetadataViewModel"]["metadata"]["contentMetadataViewModel"]
+        ["metadataRows"]
+        .as_array()?
+        .iter()
+        .flat_map(|row| row["metadataParts"].as_array().into_iter().flatten())
+        .find(|part| part["text"]["commandRuns"].is_array())
+}
+
+/// Parse a single `lockupViewModel` (newer playlist video item) into a [`Video`].
+/// Returns [`None`] if it is not a video lockup or lacks a content id.
+fn parse_lockup_video(
+    lockup: &serde_json::Value,
+    fallback_channel: Option<&Channel>,
+) -> Option<Video> {
+    let id = lockup["contentId"].as_str()?;
+    if id.is_empty() {
+        return None;
+    }
+
+    let metadata = &lockup["metadata"]["lockupMetadataViewModel"];
+    let title = metadata["title"]["content"].as_str().unwrap_or("").to_string();
+
+    let thumbnail_view = &lockup["contentImage"]["thumbnailViewModel"];
+
+    // Duration sits in a thumbnail overlay badge.
+    let duration_raw = thumbnail_view["overlays"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|overlay| {
+            overlay["thumbnailBottomOverlayViewModel"]["badges"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .find_map(|badge| badge["thumbnailBadgeViewModel"]["text"].as_str())
+        .map(|x| x.to_string());
+
+    let thumbnails = thumbnail_view["image"]["sources"]
+        .as_array()
+        .map(|sources| {
+            sources
+                .iter()
+                .map(|x| Thumbnail {
+                    width: x
+                        .get("width")
+                        .and_then(|x| {
+                            if x.is_string() {
+                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
+                            } else {
+                                x.as_i64()
+                            }
+                        })
+                        .unwrap_or(0i64) as u64,
+                    height: x
+                        .get("height")
+                        .and_then(|x| {
+                            if x.is_string() {
+                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
+                            } else {
+                                x.as_i64()
+                            }
+                        })
+                        .unwrap_or(0i64) as u64,
+                    url: x.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                })
+                .collect::<Vec<Thumbnail>>()
+        })
+        .unwrap_or_default();
+
+    let channel = match lockup_channel_metadata_part(lockup) {
+        Some(part) => {
+            let browse = &part["text"]["commandRuns"][0]["onTap"]["innertubeCommand"]
+                ["browseEndpoint"];
+            let canonical = browse["canonicalBaseUrl"]
+                .as_str()
+                .or_else(|| {
+                    part["text"]["commandRuns"][0]["onTap"]["innertubeCommand"]["commandMetadata"]
+                        ["webCommandMetadata"]["url"]
+                        .as_str()
+                })
+                .unwrap_or("");
+            Channel {
+                id: browse["browseId"].as_str().unwrap_or("").to_string(),
+                name: part["text"]["content"].as_str().unwrap_or("").to_string(),
+                url: if canonical.is_empty() {
+                    String::new()
+                } else {
+                    format!("https://www.youtube.com{canonical}")
+                },
+                icon: vec![],
+                verified: false,
+                subscribers: 0,
+            }
+        }
+        // Course playlists carry no per-video channel; fall back to the playlist owner.
+        None => fallback_channel.cloned().unwrap_or(Channel {
+            id: String::new(),
+            name: String::new(),
+            url: String::new(),
+            icon: vec![],
+            verified: false,
+            subscribers: 0,
+        }),
+    };
+
+    Some(Video {
+        id: id.to_string(),
+        // Keep parity with legacy parsing, which stored the bare video id here.
+        url: id.to_string(),
+        title,
+        description: String::new(),
+        duration: duration_raw
+            .as_deref()
+            .map(|x| time_to_ms(x) as u64)
+            .unwrap_or(0),
+        duration_raw: duration_raw.unwrap_or_else(|| "0:00".to_string()),
+        thumbnails,
+        channel,
+        uploaded_at: None,
+        views: 0,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
