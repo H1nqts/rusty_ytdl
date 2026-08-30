@@ -1314,6 +1314,41 @@ impl Playlist {
     }
 }
 
+/// Collect a `sources`/`thumbnails` array into [`Thumbnail`]s.
+fn parse_thumbnails(sources: &serde_json::Value) -> Vec<Thumbnail> {
+    sources
+        .as_array()
+        .map(|sources| {
+            sources
+                .iter()
+                .map(|x| Thumbnail {
+                    width: x
+                        .get("width")
+                        .and_then(|x| {
+                            if x.is_string() {
+                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
+                            } else {
+                                x.as_i64()
+                            }
+                        })
+                        .unwrap_or(0i64) as u64,
+                    height: x
+                        .get("height")
+                        .and_then(|x| {
+                            if x.is_string() {
+                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
+                            } else {
+                                x.as_i64()
+                            }
+                        })
+                        .unwrap_or(0i64) as u64,
+                    url: x.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                })
+                .collect::<Vec<Thumbnail>>()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a view count label into a number.
 ///
 /// `lockupViewModel` items only carry the abbreviated label shown in the UI
@@ -1393,6 +1428,36 @@ fn lockup_views_metadata_row(lockup: &serde_json::Value) -> (Option<&str>, Optio
     (views, uploaded_at)
 }
 
+/// Read the channel avatar out of a `lockupViewModel`.
+///
+/// Unlike the legacy renderers, which nest it under the video item, the avatar
+/// sits beside the metadata rows. Only a single size is served here.
+fn lockup_channel_icon(lockup: &serde_json::Value) -> Vec<Thumbnail> {
+    parse_thumbnails(
+        &lockup["metadata"]["lockupMetadataViewModel"]["image"]["decoratedAvatarViewModel"]
+            ["avatar"]["avatarViewModel"]["image"]["sources"],
+    )
+}
+
+/// Whether the channel `metadataPart` carries a verified badge.
+///
+/// The badge rides along as an `attachmentRun` on the channel name, drawn from
+/// a client side image rather than the `ownerBadges` the legacy renderers use.
+fn lockup_channel_verified(part: &serde_json::Value) -> bool {
+    part["text"]["attachmentRuns"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|run| {
+            run["element"]["type"]["imageType"]["image"]["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|source| source["clientResource"]["imageName"].as_str())
+        .any(|name| name.to_lowercase().contains("check_circle"))
+}
+
 /// Find the channel `metadataPart` inside a `lockupViewModel`'s metadata rows.
 ///
 /// In the `lockupViewModel` format the channel name lives in the first metadata row,
@@ -1437,37 +1502,7 @@ fn parse_lockup_video(
         .find_map(|badge| badge["thumbnailBadgeViewModel"]["text"].as_str())
         .map(|x| x.to_string());
 
-    let thumbnails = thumbnail_view["image"]["sources"]
-        .as_array()
-        .map(|sources| {
-            sources
-                .iter()
-                .map(|x| Thumbnail {
-                    width: x
-                        .get("width")
-                        .and_then(|x| {
-                            if x.is_string() {
-                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
-                            } else {
-                                x.as_i64()
-                            }
-                        })
-                        .unwrap_or(0i64) as u64,
-                    height: x
-                        .get("height")
-                        .and_then(|x| {
-                            if x.is_string() {
-                                x.as_str().map(|x| x.parse::<i64>().unwrap_or_default())
-                            } else {
-                                x.as_i64()
-                            }
-                        })
-                        .unwrap_or(0i64) as u64,
-                    url: x.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                })
-                .collect::<Vec<Thumbnail>>()
-        })
-        .unwrap_or_default();
+    let thumbnails = parse_thumbnails(&thumbnail_view["image"]["sources"]);
 
     let channel = match lockup_channel_metadata_part(lockup) {
         Some(part) => {
@@ -1489,8 +1524,8 @@ fn parse_lockup_video(
                 } else {
                     format!("https://www.youtube.com{canonical}")
                 },
-                icon: vec![],
-                verified: false,
+                icon: lockup_channel_icon(lockup),
+                verified: lockup_channel_verified(part),
                 subscribers: 0,
             }
         }
