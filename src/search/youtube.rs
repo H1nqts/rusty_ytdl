@@ -25,6 +25,10 @@ static PLAYLIST_ID: Lazy<Regex> =
 static ALBUM_REGEX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(RDC|O)LAK5uy_[a-zA-Z0-9-_]{33}").unwrap());
 
+/// Matches a view count label such as `1,234`, `12K` or `7.6M`.
+static VIEW_COUNT_TEXT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)([0-9][0-9.,]*)\s*([KMB])?").unwrap());
+
 #[derive(Clone, derive_more::Display, derivative::Derivative)]
 #[display("YouTube()")]
 #[derivative(Debug, PartialEq, Eq)]
@@ -1257,8 +1261,22 @@ impl Playlist {
                         subscribers: 0,
                     }
                 },
-                uploaded_at: None,
-                views: 0,
+                // `videoInfo` runs read like `["12K views", " • ", "2 days ago"]`.
+                uploaded_at: video["videoInfo"]["runs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|x| x["text"].as_str())
+                    .find(|x| !x.contains("view") && !x.trim().is_empty() && x.trim() != "•")
+                    .map(|x| x.to_string()),
+                views: video["videoInfo"]["runs"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|x| x["text"].as_str())
+                    .find(|x| x.contains("view"))
+                    .map(parse_view_count)
+                    .unwrap_or(0),
             });
         }
 
@@ -1294,6 +1312,85 @@ impl Playlist {
 
         None
     }
+}
+
+/// Parse a view count label into a number.
+///
+/// `lockupViewModel` items only carry the abbreviated label shown in the UI
+/// (`"12K views"`, `"1.3M views"`), so the suffix has to be expanded. Labels
+/// that already spell out the count (`"1,234 views"`) are parsed as-is.
+fn parse_view_count(text: &str) -> u64 {
+    let captures = match VIEW_COUNT_TEXT.captures(text) {
+        Some(captures) => captures,
+        None => return 0,
+    };
+
+    let number = match captures[1].replace(',', "").parse::<f64>() {
+        Ok(number) => number,
+        Err(_) => return 0,
+    };
+
+    let multiplier = match captures
+        .get(2)
+        .map(|x| x.as_str().to_lowercase())
+        .as_deref()
+    {
+        Some("k") => 1_000f64,
+        Some("m") => 1_000_000f64,
+        Some("b") => 1_000_000_000f64,
+        _ => 1f64,
+    };
+
+    (number * multiplier).round() as u64
+}
+
+/// Find the views/age `metadataRow` inside a `lockupViewModel`.
+///
+/// The row reads like `["12K views", "2 days ago"]`, so it is located by the
+/// part mentioning views; the remaining part is the age.
+/// Returns the `(views, uploaded_at)` texts, both of which may be absent.
+fn lockup_views_metadata_row(lockup: &serde_json::Value) -> (Option<&str>, Option<&str>) {
+    let row = lockup["metadata"]["lockupMetadataViewModel"]["metadata"]
+        ["contentMetadataViewModel"]["metadataRows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| {
+            row["metadataParts"]
+                .as_array()
+                .map(|parts| {
+                    parts.iter().any(|part| {
+                        part["text"]["content"]
+                            .as_str()
+                            .map(|x| x.contains("view"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+
+    let parts = match row {
+        Some(row) => row["metadataParts"].as_array(),
+        None => None,
+    };
+
+    let parts = match parts {
+        Some(parts) => parts,
+        None => return (None, None),
+    };
+
+    let views = parts
+        .iter()
+        .find_map(|part| part["text"]["content"].as_str())
+        .filter(|x| x.contains("view"));
+
+    // The age sits in the part right after the views one.
+    let uploaded_at = parts
+        .iter()
+        .filter_map(|part| part["text"]["content"].as_str())
+        .find(|x| !x.contains("view"));
+
+    (views, uploaded_at)
 }
 
 /// Find the channel `metadataPart` inside a `lockupViewModel`'s metadata rows.
@@ -1408,6 +1505,8 @@ fn parse_lockup_video(
         }),
     };
 
+    let (views, uploaded_at) = lockup_views_metadata_row(lockup);
+
     Some(Video {
         id: id.to_string(),
         // Keep parity with legacy parsing, which stored the bare video id here.
@@ -1421,8 +1520,8 @@ fn parse_lockup_video(
         duration_raw: duration_raw.unwrap_or_else(|| "0:00".to_string()),
         thumbnails,
         channel,
-        uploaded_at: None,
-        views: 0,
+        uploaded_at: uploaded_at.map(|x| x.to_string()),
+        views: views.map(parse_view_count).unwrap_or(0),
     })
 }
 
