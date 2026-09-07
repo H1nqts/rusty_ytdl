@@ -1042,42 +1042,51 @@ impl Playlist {
     /// ```
     pub async fn fetch(&mut self, limit: Option<u64>) -> &mut Self {
         let limit = limit.unwrap_or(u64::MAX);
-        // if continuation token not found return self without fetch videos
-        let if_and_while_situation = self.continuation.is_none()
-            || self
-                .continuation
-                .as_ref()
-                .and_then(|x| x.token.clone())
-                .is_none();
 
-        if if_and_while_situation {
+        // if continuation token not found return self without fetch videos
+        if !self.has_continuation_token() {
+            self.fetch_stopped = Some(FetchStop::NoContinuationToken);
             return self;
         }
 
-        while !(self.continuation.is_none()
-            || self
-                .continuation
-                .as_ref()
-                .and_then(|x| x.token.clone())
-                .is_none())
-        {
-            if self.videos.len() as u64 >= limit {
+        loop {
+            if !self.has_continuation_token() {
+                self.fetch_stopped = Some(FetchStop::Completed);
                 break;
             }
-            let chunk = self.next(Some(limit)).await;
+
+            if self.videos.len() as u64 >= limit {
+                self.fetch_stopped = Some(FetchStop::LimitReached);
+                break;
+            }
 
             // if error encountered finish the job
-            if chunk.is_err() {
-                break;
-            }
+            let chunk = match self.next(Some(limit)).await {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    self.fetch_stopped = Some(FetchStop::RequestFailed(err.to_string()));
+                    break;
+                }
+            };
 
             // if any not new data finish the job
-            if chunk.unwrap().is_empty() {
+            if chunk.is_empty() {
+                // `next` reports a shape change itself, so keep that reason.
+                if self.fetch_stopped.is_none() {
+                    self.fetch_stopped = Some(FetchStop::EmptyPage);
+                }
                 break;
             }
         }
 
         self
+    }
+
+    fn has_continuation_token(&self) -> bool {
+        self.continuation
+            .as_ref()
+            .map(|x| x.token.is_some())
+            .unwrap_or(false)
     }
 
     pub fn is_playlist(url_or_id: impl Into<String>) -> bool {
