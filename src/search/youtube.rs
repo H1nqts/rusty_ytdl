@@ -326,6 +326,8 @@ pub struct PlaylistSearchOptions {
     pub request_options: Option<RequestOptions>,
     /// Fetch all videos and avoid limit
     pub fetch_all: bool,
+    /// Also fetch entries hidden from the default listing
+    pub include_unavailable: bool,
 }
 
 impl Default for PlaylistSearchOptions {
@@ -334,6 +336,7 @@ impl Default for PlaylistSearchOptions {
             limit: 100,
             request_options: None,
             fetch_all: false,
+            include_unavailable: false,
         }
     }
 }
