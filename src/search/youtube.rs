@@ -471,6 +471,11 @@ pub struct Playlist {
     /// Whether this is a YouTube "course" or learning playlist.
     /// Course playlists don't have per-video channel info.
     pub is_course: bool,
+    /// Entries left out of `videos` because they could not be parsed,
+    /// accumulated across every page fetched so far
+    pub skipped: Vec<SkippedEntry>,
+    /// Why pagination stopped. [`None`] until [`Playlist::fetch`] runs
+    pub fetch_stopped: Option<FetchStop>,
 
     #[serde(skip_serializing)]
     #[derivative(PartialEq = "ignore")]
@@ -694,7 +699,7 @@ impl Playlist {
                     subscribers: 0,
                 };
 
-                let (videos, _skipped) = Self::get_playlist_videos(
+                let (videos, skipped) = Self::get_playlist_videos(
                     contents,
                     Some(options.limit),
                     Some(&playlist_channel),
@@ -832,6 +837,8 @@ impl Playlist {
                             }
                         })
                         .unwrap_or(false),
+                    skipped,
+                    fetch_stopped: None,
                 };
 
                 // we will try to fetch all videos from playlist
@@ -977,11 +984,16 @@ impl Playlist {
             .unwrap_or(serde_json::Value::Null);
 
         if contents.is_null() {
+            // Report the missing action rather than letting `fetch` read the
+            // empty result as a finished playlist.
+            self.fetch_stopped = Some(FetchStop::ResponseShapeChanged);
             return Ok(vec![]);
         }
 
-        let (fetched_videos, _skipped) =
+        let (fetched_videos, skipped) =
             Self::get_playlist_videos(&contents, Some(limit), Some(&self.channel));
+
+        self.skipped.extend(skipped);
 
         self.continuation = Some(Continuation {
             token: Self::get_continuation_token(&contents),
@@ -2537,6 +2549,9 @@ fn format_search_result(
                         client: client.clone(),
                         // Unknown for search results - will be detected when fetched
                         is_course: false,
+                        // nothing parsed yet, so nothing could have been skipped
+                        skipped: vec![],
+                        fetch_stopped: None,
                     };
 
                     res.push(SearchResult::Playlist(playlist));
