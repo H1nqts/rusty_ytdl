@@ -1567,6 +1567,53 @@ pub struct Continuation {
     client_version: Option<String>,
 }
 
+/// Why a playlist entry could not be parsed into a [`Video`]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type", content = "detail")]
+pub enum SkipReason {
+    /// The `lockupViewModel` carried no `contentId`
+    MissingContentId,
+    /// The `lockupViewModel` carried an empty `contentId`
+    EmptyContentId,
+    /// The `playlistVideoRenderer` carried no `videoId`
+    MissingVideoId,
+    /// Entry was neither renderer. Holds its top level JSON key, so a value here
+    /// means YouTube changed the response shape
+    UnknownRendererType(String),
+    /// The page contents were not an array, so no entry could be read
+    ContainerNotArray,
+}
+
+/// A playlist entry that was left out of [`Playlist::videos`]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkippedEntry {
+    /// Position within the page the entry came from
+    pub index: usize,
+    /// Only set when the id survived long enough to be read
+    pub video_id: Option<String>,
+    pub reason: SkipReason,
+}
+
+/// Why [`Playlist::fetch`] stopped requesting further pages
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type", content = "detail")]
+pub enum FetchStop {
+    /// Continuation tokens ran out, so the playlist was read in full
+    Completed,
+    /// The requested limit was reached
+    LimitReached,
+    /// No continuation token was present to begin with
+    NoContinuationToken,
+    /// A page request failed. Holds the display form of the [`VideoError`],
+    /// which is neither [`Clone`] nor [`PartialEq`] and cannot be stored as is
+    RequestFailed(String),
+    /// The response carried no `appendContinuationItemsAction`
+    ResponseShapeChanged,
+    /// The response parsed but yielded no new entry
+    EmptyPage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {

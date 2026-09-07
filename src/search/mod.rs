@@ -1,8 +1,8 @@
 mod youtube;
 
 pub use youtube::{
-    Channel, EmbedOptions, Playlist, PlaylistSearchOptions, RequestOptions, SearchOptions,
-    SearchResult, SearchType, Video, YouTube,
+    Channel, EmbedOptions, FetchStop, Playlist, PlaylistSearchOptions, RequestOptions,
+    SearchOptions, SearchResult, SearchType, SkipReason, SkippedEntry, Video, YouTube,
 };
 
 #[derive(Debug, Clone)]
