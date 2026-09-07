@@ -606,6 +606,25 @@ impl Playlist {
 
         if !html.is_empty() {
             let serde_value = serde_json::from_str::<serde_json::Value>(&html).unwrap();
+
+            // Re-request with the toggle's params so the hidden entries are listed too.
+            let unavailable_value = match options
+                .include_unavailable
+                .then(|| show_unavailable_params(&serde_value))
+                .flatten()
+            {
+                Some(params) => {
+                    Self::browse_with_params(&client, &url, &html_first, &params).await?
+                }
+                None => serde_json::Value::Null,
+            };
+
+            let serde_value = if unavailable_value.is_null() {
+                &serde_value
+            } else {
+                &unavailable_value
+            };
+
             let item_section = &serde_value["contents"]["twoColumnBrowseResultsRenderer"]["tabs"]
                 [0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]
                 ["itemSectionRenderer"]["contents"];
@@ -1137,6 +1156,54 @@ impl Playlist {
         ))
     }
 
+    /// Ask the browse endpoint for the playlist again, passing `params` from the
+    /// "Show unavailable videos" toggle. Returns the same shape as `ytInitialData`.
+    async fn browse_with_params(
+        client: &reqwest_middleware::ClientWithMiddleware,
+        url: &str,
+        html: &str,
+        params: &str,
+    ) -> Result<serde_json::Value, VideoError> {
+        let list_id = match PLAYLIST_ID
+            .find(url)
+            .or_else(|| ALBUM_REGEX.find(url))
+            .map(|x| x.as_str())
+        {
+            Some(id) => id,
+            None => return Ok(serde_json::Value::Null),
+        };
+
+        let body = serde_json::json!({
+            "browseId": format!("VL{list_id}"),
+            "params": params,
+            "context": {
+                "client": {
+                    "utcOffsetMinutes": 0,
+                    "gl": "US",
+                    "hl": "en",
+                    "clientName": "WEB",
+                    "clientVersion": get_client_version(html),
+                },
+                "user": {},
+                "request": {},
+            }
+        });
+
+        let res = client
+            .post(format!(
+                "https://www.youtube.com/youtubei/v1/browse?key={}",
+                get_api_key(html)
+            ))
+            .json(&body)
+            .send()
+            .await
+            .map_err(VideoError::ReqwestMiddleware)?;
+
+        res.json::<serde_json::Value>()
+            .await
+            .map_err(|_| VideoError::BodyCannotParsed)
+    }
+
     fn get_playlist_videos(
         container: &serde_json::Value,
         limit: Option<u64>,
@@ -1531,6 +1598,41 @@ const NON_VIDEO_ENTRY_KEYS: [&str; 3] = [
     "continuationItemViewModel",
     "messageRenderer",
 ];
+
+/// `params` of the "Show unavailable videos" toggle
+///
+/// YouTube leaves some entries out of the default listing and offers this toggle
+/// to include them. [`None`] means the playlist hides nothing.
+fn show_unavailable_params(data: &serde_json::Value) -> Option<String> {
+    fn walk(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Object(object) => {
+                let hides_entries = object
+                    .get("title")
+                    .and_then(|title| title["content"].as_str())
+                    .map(|title| title.to_lowercase().contains("unavailable"))
+                    .unwrap_or(false);
+
+                if hides_entries {
+                    let params = object["rendererContext"]["commandContext"]["onTap"]
+                        ["innertubeCommand"]["browseEndpoint"]["params"]
+                        .as_str();
+
+                    if let Some(params) = params {
+                        return Some(params.to_string());
+                    }
+                }
+
+                object.values().find_map(walk)
+            }
+            serde_json::Value::Array(array) => array.iter().find_map(walk),
+            _ => None,
+        }
+    }
+
+    // The toggle carries its params percent encoded, but the API wants them raw.
+    walk(data).map(|params| params.replace("%3D", "="))
+}
 
 /// Top level keys of an entry that is neither a known video renderer nor an
 /// expected non-video entry. [`None`] means the entry is safe to ignore.
