@@ -1688,6 +1688,13 @@ fn parse_lockup_video(
         .find_map(|badge| badge["thumbnailBadgeViewModel"]["text"].as_str())
         .map(|x| x.to_string());
 
+    // Entries YouTube cannot serve keep their id but lose the badge, along with
+    // the title and every metadata row.
+    let duration_raw = match duration_raw {
+        Some(duration_raw) => duration_raw,
+        None => return Err(SkipReason::Unplayable),
+    };
+
     let thumbnails = parse_thumbnails(&thumbnail_view["image"]["sources"]);
 
     let channel = match lockup_channel_metadata_part(lockup) {
@@ -1734,11 +1741,8 @@ fn parse_lockup_video(
         url: id.to_string(),
         title,
         description: String::new(),
-        duration: duration_raw
-            .as_deref()
-            .map(|x| time_to_ms(x) as u64)
-            .unwrap_or(0),
-        duration_raw: duration_raw.unwrap_or_else(|| "0:00".to_string()),
+        duration: time_to_ms(&duration_raw) as u64,
+        duration_raw,
         thumbnails,
         channel,
         uploaded_at: uploaded_at.map(|x| x.to_string()),
@@ -1763,6 +1767,8 @@ pub enum SkipReason {
     EmptyContentId,
     /// The `playlistVideoRenderer` carried no `videoId`
     MissingVideoId,
+    /// Deleted, private or otherwise not playable
+    Unplayable,
     /// Entry was neither renderer. Holds its top level JSON keys, so a value
     /// here means YouTube changed the response shape
     UnknownRendererType(String),
