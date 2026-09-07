@@ -12,8 +12,16 @@ async fn search_playlist() {
     )
     .await;
 
-    println!(
-        "{:#?}",
-        playlist.and_then(|x| Ok(x.videos.len())).unwrap_or(0)
+    let playlist = playlist.expect("playlist request failed");
+
+    println!("videos: {}", playlist.videos.len());
+    println!("skipped: {}", playlist.skipped.len());
+    println!("{:#?}", playlist.skipped);
+    println!("fetch stopped: {:?}", playlist.fetch_stopped);
+
+    assert!(
+        !playlist.videos.is_empty(),
+        "no video parsed, skipped: {:#?}",
+        playlist.skipped
     );
 }
