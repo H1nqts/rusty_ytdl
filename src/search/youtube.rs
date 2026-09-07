@@ -694,7 +694,7 @@ impl Playlist {
                     subscribers: 0,
                 };
 
-                let videos = Self::get_playlist_videos(
+                let (videos, _skipped) = Self::get_playlist_videos(
                     contents,
                     Some(options.limit),
                     Some(&playlist_channel),
@@ -980,7 +980,8 @@ impl Playlist {
             return Ok(vec![]);
         }
 
-        let fetched_videos = Self::get_playlist_videos(&contents, Some(limit), Some(&self.channel));
+        let (fetched_videos, _skipped) =
+            Self::get_playlist_videos(&contents, Some(limit), Some(&self.channel));
 
         self.continuation = Some(Continuation {
             token: Self::get_continuation_token(&contents),
@@ -1116,16 +1117,24 @@ impl Playlist {
         container: &serde_json::Value,
         limit: Option<u64>,
         fallback_channel: Option<&Channel>,
-    ) -> Vec<Video> {
+    ) -> (Vec<Video>, Vec<SkippedEntry>) {
         let limit = limit.unwrap_or(u64::MAX);
 
         let mut videos: Vec<Video> = vec![];
+        let mut skipped: Vec<SkippedEntry> = vec![];
 
         if !container.is_array() {
-            return vec![];
+            return (
+                videos,
+                vec![SkippedEntry {
+                    index: 0,
+                    video_id: None,
+                    reason: SkipReason::ContainerNotArray,
+                }],
+            );
         }
 
-        for info in container.as_array().unwrap() {
+        for (index, info) in container.as_array().unwrap().iter().enumerate() {
             // If limit reached break the loop
             if limit == videos.len() as u64 {
                 break;
@@ -1133,17 +1142,36 @@ impl Playlist {
 
             // Newer playlist responses represent each video as a `lockupViewModel`.
             if !info["lockupViewModel"].is_null() {
-                if let Some(video) =
-                    parse_lockup_video(&info["lockupViewModel"], fallback_channel)
-                {
-                    videos.push(video);
+                let lockup = &info["lockupViewModel"];
+                match parse_lockup_video(lockup, fallback_channel) {
+                    Ok(video) => videos.push(video),
+                    Err(reason) => skipped.push(SkippedEntry {
+                        index,
+                        video_id: lockup["contentId"].as_str().map(|x| x.to_string()),
+                        reason,
+                    }),
                 }
                 continue;
             }
 
             let video = &info["playlistVideoRenderer"];
             // video not proper type skip it - only require videoId to be present
-            if video.is_null() || video["videoId"].is_null() {
+            if video.is_null() {
+                if let Some(key) = unexpected_entry_key(info) {
+                    skipped.push(SkippedEntry {
+                        index,
+                        video_id: None,
+                        reason: SkipReason::UnknownRendererType(key),
+                    });
+                }
+                continue;
+            }
+            if video["videoId"].is_null() {
+                skipped.push(SkippedEntry {
+                    index,
+                    video_id: None,
+                    reason: SkipReason::MissingVideoId,
+                });
                 continue;
             }
 
@@ -1280,7 +1308,7 @@ impl Playlist {
             });
         }
 
-        videos
+        (videos, skipped)
     }
 
     fn get_continuation_token(context: &serde_json::Value) -> Option<String> {
@@ -1472,15 +1500,47 @@ fn lockup_channel_metadata_part(lockup: &serde_json::Value) -> Option<&serde_jso
         .find(|part| part["text"]["commandRuns"].is_array())
 }
 
+/// Entries that are not videos but are still expected in a playlist page, so
+/// leaving them out is not a parsing failure worth reporting.
+const NON_VIDEO_ENTRY_KEYS: [&str; 3] = [
+    "continuationItemRenderer",
+    "continuationItemViewModel",
+    "messageRenderer",
+];
+
+/// Top level keys of an entry that is neither a known video renderer nor an
+/// expected non-video entry. [`None`] means the entry is safe to ignore.
+fn unexpected_entry_key(info: &serde_json::Value) -> Option<String> {
+    let object = info.as_object()?;
+
+    if NON_VIDEO_ENTRY_KEYS
+        .iter()
+        .any(|key| object.contains_key(*key))
+    {
+        return None;
+    }
+
+    let keys = object.keys().cloned().collect::<Vec<String>>();
+
+    if keys.is_empty() {
+        return None;
+    }
+
+    Some(keys.join(", "))
+}
+
 /// Parse a single `lockupViewModel` (newer playlist video item) into a [`Video`].
-/// Returns [`None`] if it is not a video lockup or lacks a content id.
+/// Returns the [`SkipReason`] if it is not a video lockup or lacks a content id.
 fn parse_lockup_video(
     lockup: &serde_json::Value,
     fallback_channel: Option<&Channel>,
-) -> Option<Video> {
-    let id = lockup["contentId"].as_str()?;
+) -> Result<Video, SkipReason> {
+    let id = match lockup["contentId"].as_str() {
+        Some(id) => id,
+        None => return Err(SkipReason::MissingContentId),
+    };
     if id.is_empty() {
-        return None;
+        return Err(SkipReason::EmptyContentId);
     }
 
     let metadata = &lockup["metadata"]["lockupMetadataViewModel"];
@@ -1542,7 +1602,7 @@ fn parse_lockup_video(
 
     let (views, uploaded_at) = lockup_views_metadata_row(lockup);
 
-    Some(Video {
+    Ok(Video {
         id: id.to_string(),
         // Keep parity with legacy parsing, which stored the bare video id here.
         url: id.to_string(),
@@ -1577,8 +1637,8 @@ pub enum SkipReason {
     EmptyContentId,
     /// The `playlistVideoRenderer` carried no `videoId`
     MissingVideoId,
-    /// Entry was neither renderer. Holds its top level JSON key, so a value here
-    /// means YouTube changed the response shape
+    /// Entry was neither renderer. Holds its top level JSON keys, so a value
+    /// here means YouTube changed the response shape
     UnknownRendererType(String),
     /// The page contents were not an array, so no entry could be read
     ContainerNotArray,
